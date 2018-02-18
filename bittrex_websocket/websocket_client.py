@@ -206,6 +206,9 @@ class BittrexSocket(WebSocket):
         self.threads = {}
         self.tickers = Ticker()
         self.max_tickers_per_conn = 20
+        # This is a workaround: capture signalr call IDs and associate them with tickers
+        # so that we can know which snapshots belong to what ticker
+        self.ticker_call_id_map = {}
         self._start_main_thread()
 
     # ===========================
@@ -505,7 +508,14 @@ class BittrexSocket(WebSocket):
             try:
                 logger.info('[Subscription][{}][{}]: Order book snapshot '
                             'requested.'.format(SUB_TYPE_ORDERBOOK, ticker))
+                
                 conn.corehub.server.invoke(method, ticker)
+                # hack: steal the call ID from signalr so that we can correspond snapshots to
+                # tickers (because of a bug in bittrex backend, snapshots have MarketName empty
+                # signalr-client is unmaintained, no point in doing this correctly
+                # (https://github.com/TargetProcess/signalr-client-py/pull/29)
+                call_id = conn.corehub.server._HubServer__connection._Connection__send_counter
+                self.ticker_call_id_map[call_id] = ticker
                 self.tickers.set_snapshot_state(ticker, SNAPSHOT_SENT)
             except Exception as e:
                 print(e)
@@ -929,14 +939,17 @@ class BittrexSocket(WebSocket):
     def _is_orderbook_snapshot(self, msg):
         # Detect if the message contains order book snapshots and manipulate them.
         if 'R' in msg and type(msg['R']) is not bool:
-            if 'MarketName' in msg['R'] and msg['R']['MarketName'] is None:
-                for ticker in self.tickers.list.values():
-                    if ticker[SUB_TYPE_ORDERBOOK]['SnapshotState'] == SNAPSHOT_SENT:
-                        msg['R']['MarketName'] = ticker['Name']
-                        del msg['R']['Fills']
-                        self.order_books[ticker['Name']] = msg['R']
-                        self.tickers.set_snapshot_state(ticker['Name'], SNAPSHOT_RCVD)
-                        break
+            if 'MarketName' in msg['R']:
+                # hack: using the call ID we stole from signalr in _handle_get_snapshot(),
+                # look up the ticker we've asked for
+                if msg['R']['MarketName'] is None:
+                    msg['R']['MarketName'] = self.ticker_call_id_map[int(msg['I'])]
+                    del self.ticker_call_id_map[msg['I']]
+                    
+                del msg['R']['Fills']
+                self.order_books[msg['MarketName']] = msg['R']
+                self.tickers.set_snapshot_state(msg['MarketName'], SNAPSHOT_RCVD)
+
                 logger.info(
                     '[Subscription][{}][{}]: Order book snapshot received.'.format(SUB_TYPE_ORDERBOOK,
                                                                                    msg['R']['MarketName']))
